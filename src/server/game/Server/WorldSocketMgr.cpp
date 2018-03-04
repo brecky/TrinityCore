@@ -44,8 +44,13 @@ public:
     }
 };
 
-WorldSocketMgr::WorldSocketMgr() : BaseSocketMgr(), _socketSystemSendBufferSize(-1), _socketApplicationSendBufferSize(65536), _tcpNoDelay(true)
+WorldSocketMgr::WorldSocketMgr() : BaseSocketMgr(), _instanceAcceptor(nullptr), _socketSystemSendBufferSize(-1), _socketApplicationSendBufferSize(65536), _tcpNoDelay(true)
 {
+}
+
+WorldSocketMgr::~WorldSocketMgr()
+{
+    ASSERT(!_instanceAcceptor, "StopNetwork must be called prior to WorldSocketMgr destruction");
 }
 
 WorldSocketMgr& WorldSocketMgr::Instance()
@@ -54,7 +59,7 @@ WorldSocketMgr& WorldSocketMgr::Instance()
     return instance;
 }
 
-bool WorldSocketMgr::StartWorldNetwork(Trinity::Asio::IoContext& ioContext, std::string const& bindIp, uint16 port, int threadCount)
+bool WorldSocketMgr::StartWorldNetwork(Trinity::Asio::IoContext& ioContext, std::string const& bindIp, uint16 port, uint16 instancePort, int threadCount)
 {
     _tcpNoDelay = sConfigMgr->GetBoolDefault("Network.TcpNodelay", true);
 
@@ -75,9 +80,30 @@ bool WorldSocketMgr::StartWorldNetwork(Trinity::Asio::IoContext& ioContext, std:
     if (!BaseSocketMgr::StartNetwork(ioContext, bindIp, port, threadCount))
         return false;
 
+    AsyncAcceptor* instanceAcceptor = nullptr;
+    try
+    {
+        instanceAcceptor = new AsyncAcceptor(ioContext, bindIp, instancePort);
+    }
+    catch (boost::system::system_error const& err)
+    {
+        TC_LOG_ERROR("network", "Exception caught in WorldSocketMgr::StartNetwork (%s:%u): %s", bindIp.c_str(), port, err.what());
+        return false;
+    }
+
+    if (!instanceAcceptor->Bind())
+    {
+        TC_LOG_ERROR("network", "StartNetwork failed to bind instance socket acceptor");
+        return false;
+    }
+
+    _instanceAcceptor = instanceAcceptor;
+
     _acceptor->SetSocketFactory(std::bind(&BaseSocketMgr::GetSocketForAccept, this));
+    _instanceAcceptor->SetSocketFactory(std::bind(&BaseSocketMgr::GetSocketForAccept, this));
 
     _acceptor->AsyncAcceptWithCallback<&OnSocketAccept>();
+    _instanceAcceptor->AsyncAcceptWithCallback<&OnSocketAccept>();
 
     sScriptMgr->OnNetworkStart();
     return true;
@@ -85,7 +111,13 @@ bool WorldSocketMgr::StartWorldNetwork(Trinity::Asio::IoContext& ioContext, std:
 
 void WorldSocketMgr::StopNetwork()
 {
+    if (_instanceAcceptor)
+        _instanceAcceptor->Close();
+
     BaseSocketMgr::StopNetwork();
+
+    delete _instanceAcceptor;
+    _instanceAcceptor = nullptr;
 
     sScriptMgr->OnNetworkStop();
 }
